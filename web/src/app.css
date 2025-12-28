@@ -1,15 +1,15 @@
 @import 'tailwindcss';
 
 @font-face {
-	font-family: 'Berkeley Mono';
-	src: url('/BerkeleyMono-Regular.woff2') format('woff2');
+	font-family: 'Maven';
+	src: url('/Maven.woff2') format('woff2');
 	font-weight: 400;
 	font-style: normal;
 	font-display: swap;
 }
 
 @theme {
-	--font-mono: 'Berkeley Mono', 'SF Mono', 'Fira Code', monospace;
+	--font-mono: 'Maven', 'SF Mono', 'Fira Code', monospace;
 
 	--color-surface-0: #0a0a0a;
 	--color-surface-1: #111111;
