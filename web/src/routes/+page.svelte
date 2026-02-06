@@ -1,8 +1,7 @@
 <script lang="ts">
+  import { compressImage, resizeImage } from "$lib/compress-client";
   import {
-    compressImage,
     initWasm,
-    resizeImage,
     calculateResizeDimensions,
     type PresetLevel,
     type ResizeAlgorithm,
@@ -32,6 +31,8 @@
       size: number;
       savings: number;
       elapsedMs: number;
+      width: number;
+      height: number;
     };
   };
 
@@ -64,7 +65,7 @@
   let detectedFormat = $derived.by(() => {
     if (jobs.length === 0) return "png" as const;
     const formats = new Set(
-      jobs.map((j) => (j.type === "image/jpeg" ? "jpeg" : "png"))
+      jobs.map((j) => (j.type === "image/jpeg" ? "jpeg" : "png")),
     );
     if (formats.size === 1)
       return formats.values().next().value as "png" | "jpeg";
@@ -76,37 +77,46 @@
       ? "Mixed"
       : detectedFormat === "jpeg"
         ? "JPEG"
-        : "PNG"
+        : "PNG",
   );
 
   const fileInputId = "file-input";
 
   let completedJobs = $derived(jobs.filter((j) => j.result));
   let totalOriginal = $derived(
-    completedJobs.reduce((sum, j) => sum + j.size, 0)
+    completedJobs.reduce((sum, j) => sum + j.size, 0),
   );
   let totalCompressed = $derived(
-    completedJobs.reduce((sum, j) => sum + (j.result?.size ?? 0), 0)
+    completedJobs.reduce((sum, j) => sum + (j.result?.size ?? 0), 0),
   );
   let totalSavingsPct = $derived(
     totalOriginal > 0
       ? ((totalOriginal - totalCompressed) / totalOriginal) * 100
-      : 0
+      : 0,
   );
   let selectedJob = $derived(jobs.find((j) => j.id === selectedJobId) ?? null);
   let hasMultipleJobs = $derived(jobs.length > 1);
+
+  // For image comparison: check if result was resized
+  let wasResized = $derived(
+    selectedJob?.result &&
+      (selectedJob.result.width !== selectedJob.width ||
+        selectedJob.result.height !== selectedJob.height)
+  );
+  let displayWidth = $derived(selectedJob?.result?.width ?? selectedJob?.width ?? 0);
+  let displayHeight = $derived(selectedJob?.result?.height ?? selectedJob?.height ?? 0);
 
   // Check if resize option should be visible (single image, done or compressing)
   let showResizeOption = $derived(
     viewMode === "single" &&
       selectedJob !== null &&
       (selectedJob.status === "done" || selectedJob.status === "compressing") &&
-      !hasMultipleJobs
+      !hasMultipleJobs,
   );
 
   // Get aspect ratio of selected job for maintaining proportions
   let selectedAspectRatio = $derived(
-    selectedJob ? selectedJob.width / selectedJob.height : 1
+    selectedJob ? selectedJob.width / selectedJob.height : 1,
   );
 
   function handleResizeToggle() {
@@ -114,37 +124,58 @@
       // When enabling resize, set dimensions to image dimensions
       resizeWidth = selectedJob.width;
       resizeHeight = selectedJob.height;
-      resizePending = true;
+      // Initialize last applied to current so no change is pending yet
+      lastAppliedWidth = selectedJob.width;
+      lastAppliedHeight = selectedJob.height;
+      lastAppliedAlgorithm = resizeAlgorithm;
+      resizePending = false;
     } else {
       resizePending = false;
     }
   }
 
-  function handleWidthChange() {
+  // Track last applied resize settings to detect actual changes
+  let lastAppliedWidth = $state(0);
+  let lastAppliedHeight = $state(0);
+  let lastAppliedAlgorithm: ResizeAlgorithm = $state("lanczos3");
+
+  function hasResizeChanges(): boolean {
+    return (
+      resizeWidth !== lastAppliedWidth ||
+      resizeHeight !== lastAppliedHeight ||
+      resizeAlgorithm !== lastAppliedAlgorithm
+    );
+  }
+
+  function handleWidthInput() {
     if (resizeMaintainAspect && selectedJob) {
       resizeHeight = Math.max(1, Math.round(resizeWidth / selectedAspectRatio));
     }
-    resizePending = true;
+    resizePending = hasResizeChanges();
   }
 
-  function handleHeightChange() {
+  function handleHeightInput() {
     if (resizeMaintainAspect && selectedJob) {
       resizeWidth = Math.max(1, Math.round(resizeHeight * selectedAspectRatio));
     }
-    resizePending = true;
+    resizePending = hasResizeChanges();
   }
 
   function handleAlgorithmChange() {
-    resizePending = true;
+    resizePending = hasResizeChanges();
   }
 
   function applyResize() {
+    lastAppliedWidth = resizeWidth;
+    lastAppliedHeight = resizeHeight;
+    lastAppliedAlgorithm = resizeAlgorithm;
     resizePending = false;
     recompressAll();
   }
 
   function handleResizeKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") {
+    if (e.key === "Enter" && resizePending) {
+      e.preventDefault();
       applyResize();
     }
   }
@@ -157,7 +188,7 @@
     const units = ["B", "KB", "MB", "GB"];
     const exponent = Math.min(
       Math.floor(Math.log(bytes) / Math.log(1024)),
-      units.length - 1
+      units.length - 1,
     );
     const value = bytes / 1024 ** exponent;
     return `${value.toFixed(value >= 10 || value % 1 === 0 ? 0 : 1)} ${units[exponent]}`;
@@ -181,9 +212,40 @@
 
   function triggerFilePicker() {
     const input = document.getElementById(
-      fileInputId
+      fileInputId,
     ) as HTMLInputElement | null;
     if (input) input.click();
+  }
+
+  function handlePaste(e: ClipboardEvent) {
+    const target = e.target as HTMLElement | null;
+    const isTypingContext =
+      target &&
+      (target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable);
+    if (isTypingContext) return;
+
+    const clipboardData = e.clipboardData;
+    if (!clipboardData) return;
+
+    const files: File[] = [];
+
+    // Check for files in clipboard (e.g., copied from file explorer)
+    for (const item of clipboardData.items) {
+      if (item.kind === "file") {
+        const file = item.getAsFile();
+        if (file && acceptMime.includes(file.type)) {
+          files.push(file);
+        }
+      }
+    }
+
+    // If we found image files, add them
+    if (files.length > 0) {
+      e.preventDefault();
+      addFiles(files);
+    }
   }
 
   onMount(() => {
@@ -220,12 +282,14 @@
     };
 
     window.addEventListener("keydown", handler);
+    window.addEventListener("paste", handlePaste);
     window.addEventListener("mousemove", handleMouseMove);
     window.addEventListener("mouseup", handleMouseUp);
     window.addEventListener("touchmove", handleTouchMove, { passive: false });
     window.addEventListener("touchend", handleTouchEnd);
     return () => {
       window.removeEventListener("keydown", handler);
+      window.removeEventListener("paste", handlePaste);
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("mouseup", handleMouseUp);
       window.removeEventListener("touchmove", handleTouchMove);
@@ -245,7 +309,7 @@
 
     const scale = Math.min(
       maxSize / imageData.width,
-      maxSize / imageData.height
+      maxSize / imageData.height,
     );
     canvas.width = Math.round(imageData.width * scale);
     canvas.height = Math.round(imageData.height * scale);
@@ -292,9 +356,6 @@
       error: undefined,
     };
 
-    // Yield to browser so UI can update before blocking WASM call
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     try {
       // Apply resize if enabled
       let imageDataToCompress = job.imageData;
@@ -304,7 +365,7 @@
               job.width,
               job.height,
               resizeWidth,
-              resizeHeight
+              resizeHeight,
             )
           : { width: resizeWidth, height: resizeHeight };
 
@@ -341,12 +402,16 @@
       const savings =
         job.size > 0 ? ((job.size - blob.size) / job.size) * 100 : 0;
 
+      // Store the result dimensions (may differ from original if resized)
+      const resultWidth = imageDataToCompress.width;
+      const resultHeight = imageDataToCompress.height;
+
       const currentIndex = jobs.findIndex((j) => j.id === job.id);
       if (currentIndex !== -1) {
         jobs[currentIndex] = {
           ...jobs[currentIndex],
           status: "done",
-          result: { blob, url, size: blob.size, savings, elapsedMs },
+          result: { blob, url, size: blob.size, savings, elapsedMs, width: resultWidth, height: resultHeight },
         };
       }
     } catch (err) {
@@ -673,24 +738,29 @@
       class:border-neutral-600={dropActive}
       class:border-neutral-800={!dropActive}
     >
-      <div class="flex flex-col items-center gap-6 text-center">
-        <div class="text-neutral-500">
-          {@render iconLayers()}
+        <div class="flex flex-col items-center gap-6 text-center">
+          <div class="text-neutral-500">
+            {@render iconLayers()}
+          </div>
+          <div class="space-y-2">
+            <p class="text-lg text-neutral-300">Drop PNG or JPEG files here</p>
+            <p class="text-sm text-neutral-600">or paste from clipboard</p>
+          </div>
+          <button
+            class="btn-primary"
+            onclick={triggerFilePicker}
+            data-testid="select-files-button"
+            >Select Files <kbd
+              class="ml-1 inline-flex items-center rounded bg-black/10 px-1.5 py-0.5 text-xs font-normal"
+              ><span class="text-sm leading-none mr-0.5">⌘</span>O</kbd
+            ></button
+          >
+          <p class="text-xs text-neutral-600">
+            <kbd class="rounded bg-neutral-800 px-1.5 py-0.5 text-neutral-500"
+              ><span class="text-xs mr-0.5">⌘</span>V</kbd
+            > to paste
+          </p>
         </div>
-        <div class="space-y-2">
-          <p class="text-lg text-neutral-300">Drop PNG or JPEG files here</p>
-          <p class="text-sm text-neutral-600">or</p>
-        </div>
-        <button
-          class="btn-primary"
-          onclick={triggerFilePicker}
-          data-testid="select-files-button"
-          >Select Files <kbd
-            class="ml-1 inline-flex items-center rounded bg-black/10 px-1.5 py-0.5 text-xs font-normal"
-            ><span class="text-sm leading-none mr-0.5">⌘</span>O</kbd
-          ></button
-        >
-      </div>
     </div>
   </div>
 {/snippet}
@@ -732,24 +802,23 @@
     >
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
-        class="relative touch-none {zoomLevel > 1
-          ? ''
-          : 'max-h-full max-w-full'}"
+        class="relative touch-none"
         class:cursor-ew-resize={job.result}
         bind:this={imageContainerRef}
         onmousedown={handleMouseDown}
         ontouchstart={handleTouchStart}
-        style={zoomLevel > 1
-          ? `transform: scale(${zoomLevel}); transform-origin: center center;`
-          : ""}
+        style={(zoomLevel > 1 ? `transform: scale(${zoomLevel}); transform-origin: center center;` : "") +
+          (wasResized ? `width: min(${displayWidth}px, calc(100vw - 2rem), calc((100vh - 200px) * ${displayWidth} / ${displayHeight})); aspect-ratio: ${displayWidth} / ${displayHeight};` : "")}
         data-testid="image-comparison-container"
       >
         <img
           src={job.originalUrl}
           alt="Original"
-          class="object-contain select-none {zoomLevel > 1
-            ? ''
-            : 'max-h-[calc(100vh-200px)] max-w-[calc(100vw-2rem)] sm:max-h-[calc(100vh-180px)] sm:max-w-full'}"
+          class="select-none object-contain {wasResized
+            ? 'w-full h-full'
+            : zoomLevel > 1
+              ? ''
+              : 'max-h-[calc(100vh-200px)] max-w-[calc(100vw-2rem)] sm:max-h-[calc(100vh-180px)] sm:max-w-full'}"
           draggable="false"
           data-testid="original-image"
         />
@@ -763,16 +832,18 @@
             <img
               src={job.result.url}
               alt="Compressed"
-              class="object-contain select-none {zoomLevel > 1
-                ? ''
-                : 'max-h-[calc(100vh-200px)] max-w-[calc(100vw-2rem)] sm:max-h-[calc(100vh-180px)] sm:max-w-full'}"
+              class="select-none object-contain {wasResized
+                ? 'w-full h-full'
+                : zoomLevel > 1
+                  ? ''
+                  : 'max-h-[calc(100vh-200px)] max-w-[calc(100vw-2rem)] sm:max-h-[calc(100vh-180px)] sm:max-w-full'}"
               draggable="false"
               data-testid="compressed-image"
             />
           </div>
 
           <div
-            class="absolute inset-y-0 cursor-ew-resize"
+            class="absolute inset-y-0 cursor-ew-resize select-none"
             style="left: {job.slider}%;"
             data-testid="comparison-slider"
           >
@@ -813,7 +884,11 @@
       data-testid="image-info"
     >
       <p class="truncate" data-testid="image-name">{job.name}</p>
-      <p data-testid="image-dimensions">{job.width} × {job.height}</p>
+      {#if job.result && (job.result.width !== job.width || job.result.height !== job.height)}
+        <p data-testid="image-dimensions">{job.width} × {job.height} → {job.result.width} × {job.result.height}</p>
+      {:else}
+        <p data-testid="image-dimensions">{job.width} × {job.height}</p>
+      {/if}
     </div>
 
     <div
@@ -1041,7 +1116,7 @@
             max="16384"
             class="w-16 rounded bg-surface-2 px-2 py-1 text-neutral-300 text-xs"
             bind:value={resizeWidth}
-            onchange={handleWidthChange}
+            oninput={handleWidthInput}
             onkeydown={handleResizeKeydown}
             data-testid="resize-width-input"
           />
@@ -1052,7 +1127,7 @@
             max="16384"
             class="w-16 rounded bg-surface-2 px-2 py-1 text-neutral-300 text-xs"
             bind:value={resizeHeight}
-            onchange={handleHeightChange}
+            oninput={handleHeightInput}
             onkeydown={handleResizeKeydown}
             data-testid="resize-height-input"
           />
